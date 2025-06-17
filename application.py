@@ -1,3 +1,6 @@
+
+# updated to use local model path on ec2
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,13 +10,6 @@ import logging
 import time
 from typing import List, Dict, Optional
 import re
-import os
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
-import tempfile
-import shutil
-from pathlib import Path
-import zipfile
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -29,133 +25,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AWS S3 Configuration - Updated with correct values
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "manaratmodel")
-S3_MODEL_KEY = os.getenv("S3_MODEL_KEY", "Khutab_model_v2.zip")
-AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "me-south-1")
+# Load the translation model
+model_dir = "/home/ec2-user/Khutab_model_v2"
+try:
+    logger.info(f"Loading tokenizer from {model_dir}")
+    tokenizer = M2M100Tokenizer.from_pretrained(model_dir, local_files_only=True)
+    logger.info(f"Loading model from {model_dir}")
+    model = M2M100ForConditionalGeneration.from_pretrained(model_dir, local_files_only=True)
+    logger.info("Model loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading model: {e}")
+    # Fallback to the standard model if local model loading fails
+    logger.info("Using fallback: facebook/m2m100_418M (from internet)")
+    logger.info("Falling back to standard model")
+    tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_418M")
+    model = M2M100ForConditionalGeneration.from_pretrained("facebook/m2m100_418M")
 
-# Global variables for models
-model = None
-tokenizer = None
-urdu_model = None
-urdu_tokenizer = None
-
-def download_model_from_s3():
-    """Download zipped model from S3 and extract it to temporary directory"""
-    try:
-        logger.info(f"Downloading model from S3 bucket: {S3_BUCKET_NAME}")
-        
-        # Create S3 client
-        s3_client = boto3.client('s3', region_name=AWS_REGION)
-        
-        # Create temporary directory for model
-        temp_dir = tempfile.mkdtemp(prefix="khutab_model_")
-        zip_file_path = os.path.join(temp_dir, "model.zip")
-        extract_dir = os.path.join(temp_dir, "extracted")
-        
-        logger.info(f"Created temporary directory: {temp_dir}")
-        
-        try:
-            # Download the zip file
-            logger.info(f"Downloading {S3_MODEL_KEY} to {zip_file_path}")
-            s3_client.download_file(S3_BUCKET_NAME, S3_MODEL_KEY, zip_file_path)
-            
-            # Extract the zip file
-            logger.info(f"Extracting zip file to {extract_dir}")
-            os.makedirs(extract_dir, exist_ok=True)
-            
-            with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-            
-            # Remove the zip file to save space
-            os.remove(zip_file_path)
-            
-            # Find the actual model directory (might be nested)
-            model_path = None
-            for root, dirs, files in os.walk(extract_dir):
-                # Look for key model files
-                if any(f in files for f in ['config.json', 'pytorch_model.bin', 'model.safetensors']):
-                    model_path = root
-                    break
-            
-            if model_path is None:
-                logger.error("Could not find model files in extracted archive")
-                return None
-                
-            logger.info(f"Model extracted successfully to {model_path}")
-            return model_path
-            
-        except ClientError as e:
-            logger.error(f"Error downloading from S3: {e}")
-            return None
-        except zipfile.BadZipFile as e:
-            logger.error(f"Invalid zip file: {e}")
-            return None
-            
-    except NoCredentialsError:
-        logger.error("AWS credentials not found")
-        return None
-    except Exception as e:
-        logger.error(f"Error downloading model from S3: {e}")
-        return None
-
-def load_models():
-    """Load models with fallback strategy"""
-    global model, tokenizer, urdu_model, urdu_tokenizer
-    
-    # First try to download and load custom model from S3
-    model_dir = download_model_from_s3()
-    
-    if model_dir and os.path.exists(model_dir):
-        try:
-            logger.info(f"Loading custom tokenizer from {model_dir}")
-            tokenizer = M2M100Tokenizer.from_pretrained(model_dir)
-            logger.info(f"Loading custom model from {model_dir}")
-            model = M2M100ForConditionalGeneration.from_pretrained(model_dir)
-            logger.info("Custom model loaded successfully from S3")
-        except Exception as e:
-            logger.error(f"Error loading custom model from S3: {e}")
-            model = None
-            tokenizer = None
-    
-    # Fallback to standard model if custom model loading fails
-    if model is None or tokenizer is None:
-        try:
-            logger.info("Loading fallback standard model")
-            tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_418M")
-            model = M2M100ForConditionalGeneration.from_pretrained("facebook/m2m100_418M")
-            logger.info("Standard model loaded successfully")
-        except Exception as e:
-            logger.error(f"Error loading standard model: {e}")
-            raise e
-    
-    # Load base M2M100 model for Urdu translation
-    try:
-        logger.info("Loading Urdu model")
-        urdu_tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_418M")
-        urdu_model = M2M100ForConditionalGeneration.from_pretrained("facebook/m2m100_418M")
-        logger.info("Urdu model loaded successfully")
-    except Exception as e:
-        logger.error(f"Error loading Urdu model: {e}")
-        raise e
-    
-    # Clean up temporary directory if it exists
-    if model_dir and os.path.exists(model_dir):
-        try:
-            # Clean up the entire temp directory tree
-            temp_root = os.path.dirname(model_dir)
-            if temp_root.startswith(tempfile.gettempdir()):
-                shutil.rmtree(temp_root)
-                logger.info(f"Cleaned up temporary directory: {temp_root}")
-        except Exception as e:
-            logger.warning(f"Could not clean up temporary directory: {e}")
-
-# Load models on startup
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up application...")
-    load_models()
-    logger.info("Application startup complete")
+# Add: Load the base M2M100 model for Urdu translation only once
+urdu_tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_418M")
+urdu_model = M2M100ForConditionalGeneration.from_pretrained("facebook/m2m100_418M")
 
 # In-memory sermon storage
 # Structure: {mosque_name: {"segments": [{"text": arabic_text, "translations": {"en": eng_trans, "ur": ur_trans}}], "timestamp": last_update_time}}
@@ -178,16 +66,6 @@ class TranslationRequest(BaseModel):
 class SermonSegmentRequest(BaseModel):
     mosque_name: str
     segment: str
-
-# Health check endpoint for EB
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for AWS Elastic Beanstalk"""
-    return {
-        "status": "healthy",
-        "models_loaded": model is not None and tokenizer is not None,
-        "urdu_models_loaded": urdu_model is not None and urdu_tokenizer is not None
-    }
 
 # Helper: Clean sermons not updated for 3 hours (10800 seconds)
 def clean_old_sermons():
@@ -227,25 +105,19 @@ async def app_version(request: Request):
 @app.get("/")
 async def root():
     clean_old_sermons()
-    return {"message": "Translation API is running on AWS Elastic Beanstalk"}
+    return {"message": "Translation API is running"}
 
 @app.post("/translate")
 async def translate(req: TranslationRequest):
     clean_old_sermons()
     try:
-        # Check if models are loaded
-        if model is None or tokenizer is None:
-            raise HTTPException(status_code=503, detail="Models not loaded yet")
-            
         logger.info(f"Received translation request: {req.text[:50]}... -> {req.target_lang}")
 
-        # Use custom model for English, base model for Urdu
+        # ✅ استخدام نموذج مخصص إذا كانت اللغة المطلوبة هي الأردية
         local_tokenizer = tokenizer
         local_model = model
 
         if req.target_lang == "ur":
-            if urdu_model is None or urdu_tokenizer is None:
-                raise HTTPException(status_code=503, detail="Urdu model not loaded yet")
             logger.info("Using base M2M100 model for Urdu translation")
             local_tokenizer = urdu_tokenizer
             local_model = urdu_model
@@ -320,15 +192,12 @@ async def translate(req: TranslationRequest):
         logger.error(f"Translation error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
 
+
 @app.post("/add_sermon_segment")
 async def add_sermon_segment(req: SermonSegmentRequest):
     """Add a new segment to a mosque's sermon with translations"""
     clean_old_sermons()
     try:
-        # Check if models are loaded
-        if model is None or tokenizer is None or urdu_model is None or urdu_tokenizer is None:
-            raise HTTPException(status_code=503, detail="Models not loaded yet")
-            
         mosque_name = req.mosque_name
         segment = req.segment
         logger.info(f"[DEBUG] Adding sermon segment for mosque: {mosque_name}")
@@ -453,6 +322,7 @@ async def get_sermon(mosque: str):
 @app.delete("/clear_sermon")
 async def clear_sermon(mosque: str):
     """Clear all sermon content and translations for a specific mosque"""
+    # 🚫 don't call clean_old_sermons here to avoid delay
     try:
         logger.info(f"[DEBUG] clear_sermon called for mosque: {mosque}")
         
@@ -473,6 +343,7 @@ async def clear_sermon(mosque: str):
                 "message": f"Sermon and translations for {mosque} have been cleared"
             }
         else:
+            # No data to clear, respond quickly
             logger.info(f"[DEBUG] No sermon data found for {mosque}, skipping clear.")
             return {
                 "success": True,
@@ -483,6 +354,8 @@ async def clear_sermon(mosque: str):
         logger.error(f"Error clearing sermon: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error clearing sermon: {str(e)}")
 
+
+# Add an endpoint to list all active mosques with sermons
 @app.get("/active_mosques")
 async def get_active_mosques():
     """Get a list of all mosques with active sermons"""
@@ -493,10 +366,3 @@ async def get_active_mosques():
     except Exception as e:
         logger.error(f"Error getting active mosques: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting active mosques: {str(e)}")
-
-# For EB deployment - expose the app
-application = app
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
